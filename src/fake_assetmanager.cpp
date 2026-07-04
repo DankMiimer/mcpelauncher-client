@@ -20,10 +20,18 @@ struct AAssetDir {
     std::string currentFileName;
 };
 
+FakeAssetManager *FakeAssetManager::current = nullptr;
+
 FakeAssetManager::FakeAssetManager(std::string rootDir) {
     if(!rootDir.empty() && *rootDir.rbegin() != '/')
         rootDir += '/';
     this->rootDir = std::move(rootDir);
+    current = this;
+}
+
+FakeAssetManager::~FakeAssetManager() {
+    if(current == this)
+        current = nullptr;
 }
 
 namespace fake_assetmanager {
@@ -185,6 +193,29 @@ const char *AAssetDir_getNextFileName(AAssetDir *assetDir) {
 
 void FakeAssetManager::initHybrisHooks(std::unordered_map<std::string, void *> &syms) {
     using namespace fake_assetmanager;
+    syms["AAssetManager_fromJava"] = (void *)+[](void *, void *) -> AAssetManager * {
+        return (AAssetManager *)(void *)FakeAssetManager::getCurrent();
+    };
+    syms["AConfiguration_new"] = (void *)+[]() -> void * {
+        return new int(0);
+    };
+    syms["AConfiguration_delete"] = (void *)+[](void *config) {
+        delete (int *)config;
+    };
+    syms["AConfiguration_fromAssetManager"] = (void *)+[](void *, AAssetManager *) {};
+    syms["AConfiguration_getLanguage"] = (void *)+[](void *, char *out) {
+        if(out) {
+            out[0] = 'e';
+            out[1] = 'n';
+        }
+    };
+    syms["AConfiguration_getCountry"] = (void *)+[](void *, char *out) {
+        if(out) {
+            out[0] = 'U';
+            out[1] = 'S';
+        }
+    };
+
     syms["AAssetManager_open"] = (void *)AAssetManager_open;
     syms["AAssetManager_openDir"] = (void *)AAssetManager_openDir;
     syms["AAsset_close"] = (void *)AAsset_close;

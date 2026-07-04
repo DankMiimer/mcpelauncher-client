@@ -30,12 +30,22 @@ std::shared_ptr<FakeJni::JString> MainActivity::createUUID() {
 
 FakeJni::JFloat MainActivity::getPixelsPerMillimeter() {
     // assume 96 DPI for now with GUI scale of 2
-    return (96 / 25.4f) * 2 * Settings::scale;
+    float v = (96 / 25.4f) * 2 * Settings::scale;
+    static int logged = 0;
+    if(logged++ < 8)
+        Log::info("UIDiag", "getPixelsPerMillimeter -> %.3f (scale=%.3f)",
+                  v, (float)Settings::scale);
+    return v;
 }
 
 FakeJni::JInt MainActivity::getPlatformDpi() {
     // assume 96 DPI for now with GUI scale of 2
-    return 96 * 2 * Settings::scale;
+    int v = 96 * 2 * Settings::scale;
+    static int logged = 0;
+    if(logged++ < 8)
+        Log::info("UIDiag", "getPlatformDpi -> %d (scale=%.3f)",
+                  v, (float)Settings::scale);
+    return v;
 }
 
 FakeJni::JLong MainActivity::getUsedMemory() {

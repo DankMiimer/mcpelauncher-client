@@ -3,6 +3,9 @@
 #include "settings.h"
 #include "imgui_ui.h"
 #include <map>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #define __ANDROID__
 #include <EGL/egl.h>
@@ -10,6 +13,15 @@
 #include <log.h>
 #include <cstring>
 #include <game_window.h>
+#include <sys/syscall.h>
+#include <sched.h>
+#include <dirent.h>
+#include <thread>
+#include <set>
+#include <string>
+#include <cstdlib>
+#include <sys/resource.h>
+#include <unistd.h>
 #include <mcpelauncher/linker.h>
 #ifdef USE_ARMHF_SUPPORT
 #include "armhf_support.h"
@@ -19,6 +31,68 @@ namespace fake_egl {
 static thread_local EGLSurface currentDrawSurface;
 static void *(*hostProcAddrFn)(const char *);
 static std::unordered_map<std::string, void *> hostProcOverrides;
+
+struct FrameMetricsState {
+    using Clock = std::chrono::steady_clock;
+
+    bool initialized = false;
+    FILE *file = nullptr;
+    Clock::time_point firstFrame;
+    Clock::time_point previousFrame;
+    unsigned long long frame = 0;
+
+    void record(Clock::time_point frameStart, Clock::time_point swapEnd) {
+        if(!initialized) {
+            initialized = true;
+            const char *path = std::getenv("MCPE_FRAME_METRICS");
+            if(path && *path) {
+                file = std::fopen(path, "w");
+                if(file) {
+                    std::setvbuf(file, nullptr, _IOFBF, 64 * 1024);
+                    std::fputs("frame,epoch_us,elapsed_us,frame_us,swap_us,user_us,system_us,minflt,majflt,nvcsw,nivcsw,maxrss_kb\n", file);
+                    Log::info("FrameMetrics", "Recording frame times to %s", path);
+                } else {
+                    Log::error("FrameMetrics", "Unable to open %s", path);
+                }
+            }
+            firstFrame = frameStart;
+            previousFrame = frameStart;
+        }
+
+        if(!file)
+            return;
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            frameStart - firstFrame).count();
+        auto frameTime = std::chrono::duration_cast<std::chrono::microseconds>(
+            frameStart - previousFrame).count();
+        auto swapTime = std::chrono::duration_cast<std::chrono::microseconds>(
+            swapEnd - frameStart).count();
+        auto epoch = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        rusage usage{};
+        getrusage(RUSAGE_SELF, &usage);
+        auto userTime = static_cast<long long>(usage.ru_utime.tv_sec) * 1000000LL +
+                        static_cast<long long>(usage.ru_utime.tv_usec);
+        auto systemTime = static_cast<long long>(usage.ru_stime.tv_sec) * 1000000LL +
+                          static_cast<long long>(usage.ru_stime.tv_usec);
+        std::fprintf(file, "%llu,%lld,%lld,%lld,%lld,%lld,%lld,%ld,%ld,%ld,%ld,%ld\n",
+                     frame,
+                     static_cast<long long>(epoch),
+                     static_cast<long long>(elapsed),
+                     static_cast<long long>(frame ? frameTime : 0),
+                     static_cast<long long>(swapTime),
+                     userTime, systemTime,
+                     usage.ru_minflt, usage.ru_majflt,
+                     usage.ru_nvcsw, usage.ru_nivcsw,
+                     usage.ru_maxrss);
+        previousFrame = frameStart;
+        frame++;
+
+    }
+};
+
+static FrameMetricsState frameMetrics;
 
 EGLBoolean eglInitialize(EGLDisplay display, EGLint *major, EGLint *minor) {
     if(major)
@@ -102,8 +176,126 @@ EGLBoolean eglMakeCurrent(EGLDisplay display, EGLSurface draw, EGLSurface read, 
     } else {
         ((GameWindow *)currentDrawSurface)->makeCurrent(false);
     }
+    auto hostGlGetString = reinterpret_cast<const unsigned char *(*)(unsigned int)>(
+        hostProcAddrFn("glGetString"));
+    auto hostVersion = hostGlGetString ? hostGlGetString(0x1F02 /* GL_VERSION */) : nullptr;
+    auto hostContext = ::eglGetCurrentContext();
+    auto hostError = ::eglGetError();
+    Log::trace("FakeEGL",
+               "eglMakeCurrent tid=%ld draw=%p context=%p hostContext=%p hostError=0x%x hostGL=%s",
+               (long) syscall(SYS_gettid), draw, context, hostContext, hostError,
+               hostVersion ? reinterpret_cast<const char *>(hostVersion) : "(null)");
     currentDrawSurface = draw;
     return EGL_TRUE;
+}
+
+static void parseCpuList(const char *value, cpu_set_t *set) {
+    CPU_ZERO(set);
+    const char *p = value;
+    while(*p) {
+        char *end = nullptr;
+        long a = std::strtol(p, &end, 10);
+        if(end == p)
+            break;
+        long b = a;
+        p = end;
+        if(*p == '-') {
+            b = std::strtol(p + 1, &end, 10);
+            if(end == p + 1)
+                break;
+            p = end;
+        }
+        for(long c = a; c <= b; c++)
+            if(c >= 0 && c < CPU_SETSIZE)
+                CPU_SET((int)c, set);
+        if(*p == ',')
+            p++;
+    }
+}
+
+// See MCPE_PIN_RENDER_CORE / MCPE_PIN_OTHER_CORES / MCPE_AFFINITY_LOG.
+// Called once from the render (swap) thread.
+static void applyRenderAffinity() {
+    long renderTid = (long)syscall(SYS_gettid);
+    const char *renderCore = std::getenv("MCPE_PIN_RENDER_CORE");
+    if(renderCore && *renderCore) {
+        cpu_set_t set;
+        parseCpuList(renderCore, &set);
+        if(CPU_COUNT(&set) > 0 &&
+           sched_setaffinity(renderTid, sizeof(set), &set) == 0)
+            Log::info("Affinity", "Render thread %ld pinned to core(s) %s",
+                      renderTid, renderCore);
+        else
+            Log::warn("Affinity", "Could not pin render thread %ld to %s",
+                      renderTid, renderCore);
+    }
+    const char *otherCoresEnv = std::getenv("MCPE_PIN_OTHER_CORES");
+    if(otherCoresEnv && *otherCoresEnv) {
+        std::string otherCores = otherCoresEnv;
+        const char *logEnv = std::getenv("MCPE_AFFINITY_LOG");
+        bool logNames = logEnv && *logEnv == '1';
+        const char *mainCoreEnv = std::getenv("MCPE_PIN_MAIN_CORE");
+        std::string mainCore = mainCoreEnv ? mainCoreEnv : "";
+        std::thread([renderTid, otherCores, mainCore, logNames] {
+            cpu_set_t set, mainSet;
+            parseCpuList(otherCores.c_str(), &set);
+            if(CPU_COUNT(&set) == 0)
+                return;
+            bool haveMain = !mainCore.empty();
+            if(haveMain) {
+                parseCpuList(mainCore.c_str(), &mainSet);
+                if(CPU_COUNT(&mainSet) == 0)
+                    haveMain = false;
+            }
+            long self = (long)syscall(SYS_gettid);
+            // Keep the scanner off the render core (it inherits the render
+            // thread's affinity at spawn).
+            sched_setaffinity(self, sizeof(set), &set);
+            std::set<long> seen;
+            while(true) {
+                DIR *dir = opendir("/proc/self/task");
+                if(dir) {
+                    dirent *ent;
+                    while((ent = readdir(dir))) {
+                        if(ent->d_name[0] < '0' || ent->d_name[0] > '9')
+                            continue;
+                        long tid = std::strtol(ent->d_name, nullptr, 10);
+                        if(tid == renderTid || tid == self)
+                            continue;
+                        char commPath[64], comm[32] = {0};
+                        std::snprintf(commPath, sizeof(commPath),
+                                      "/proc/self/task/%ld/comm", tid);
+                        if(FILE *f = std::fopen(commPath, "r")) {
+                            if(std::fgets(comm, sizeof(comm), f))
+                                comm[strcspn(comm, "\n")] = 0;
+                            std::fclose(f);
+                        }
+                        // Mali driver threads submit GPU work on behalf of
+                        // the render thread; leave them unconfined so they
+                        // never queue behind saturated worker cores.
+                        if(strncmp(comm, "mali-", 5) == 0)
+                            continue;
+                        // The Bedrock main/simulation thread integrates chunk
+                        // results and blocks on worker locks; a dedicated core
+                        // stops workers from preempting it (kills the lock-wait
+                        // freeze). Its comm is "MINECRAFT MAIN".
+                        bool isMain = strncmp(comm, "MINECRAFT MAIN", 14) == 0;
+                        const cpu_set_t *use = (haveMain && isMain) ? &mainSet : &set;
+                        sched_setaffinity(tid, sizeof(*use), use);
+                        if(logNames && seen.insert(tid).second)
+                            Log::info("Affinity", "Confined tid %ld (%s) to %s",
+                                      tid, comm,
+                                      (haveMain && isMain) ? mainCore.c_str()
+                                                           : otherCores.c_str());
+                    }
+                    closedir(dir);
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+            }
+        }).detach();
+        Log::info("Affinity", "Confining non-render threads to core(s) %s",
+                  otherCoresEnv);
+    }
 }
 
 EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
@@ -111,12 +303,40 @@ EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
 #ifdef USE_IMGUI
     ImGuiUIDrawFrame((GameWindow*)surface);
 #endif
+    static bool affinityApplied = false;
+    if(!affinityApplied) {
+        affinityApplied = true;
+        applyRenderAffinity();
+    }
+    auto frameStart = FrameMetricsState::Clock::now();
     ((GameWindow *)surface)->swapBuffers();
+    frameMetrics.record(frameStart, FrameMetricsState::Clock::now());
     return EGL_TRUE;
 }
 
 EGLBoolean eglSwapInterval(EGLDisplay display, EGLint interval) {
-    ((GameWindow *)currentDrawSurface)->setSwapInterval(interval);
+    static int intervalOverride = -2;
+    static bool logged = false;
+    if(intervalOverride == -2) {
+        intervalOverride = -1;
+        const char *value = std::getenv("MCPE_SWAP_INTERVAL_OVERRIDE");
+        if(value && *value) {
+            char *end = nullptr;
+            long parsed = std::strtol(value, &end, 10);
+            if(end != value && *end == '\0' && (parsed == 0 || parsed == 1))
+                intervalOverride = static_cast<int>(parsed);
+            else
+                Log::warn("FakeEGL", "Ignoring invalid MCPE_SWAP_INTERVAL_OVERRIDE=%s", value);
+        }
+    }
+
+    int effectiveInterval = intervalOverride >= 0 ? intervalOverride : interval;
+    if(!logged) {
+        Log::info("FakeEGL", "Swap interval requested=%d effective=%d", interval,
+                  effectiveInterval);
+        logged = true;
+    }
+    ((GameWindow *)currentDrawSurface)->setSwapInterval(effectiveInterval);
     return EGL_TRUE;
 }
 

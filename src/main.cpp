@@ -43,6 +43,10 @@
 #include <daemon_utils/auto_shutdown_service.h>
 #include "settings.h"
 #include "imgui_ui.h"
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <sys/mman.h>
 
 struct RpcCallbackServer : daemon_utils::auto_shutdown_service {
 
@@ -67,6 +71,57 @@ LauncherOptions options;
 void printVersionInfo();
 
 void loadGameOptions();
+
+static void disablePeriodicAutoCompaction(void *handle) {
+    const char *enabled = std::getenv("MCPE_DISABLE_AUTO_COMPACTION");
+    if(enabled == nullptr || std::strcmp(enabled, "1") != 0)
+        return;
+
+    // Version-specific patch for the official arm64 1.20.62.02 binary.
+    // This changes the scheduled "Running AutoCompaction" task into its
+    // existing no-op return path. Load/save and threshold-triggered
+    // compactions remain intact.
+    auto gameDir = PathHelper::getGameDir();
+    if(gameDir.find("1.20.62.02-official-arm64") == std::string::npos) {
+        Log::warn("Smoothness", "Periodic auto-compaction patch is unavailable for %s", gameDir.c_str());
+        return;
+    }
+
+    constexpr uintptr_t instructionOffset = 0x0af3f6d8;
+    constexpr uint32_t expectedInstruction = 0x370003a8; // tbnz w8, #0, no_op_return
+    constexpr uint32_t patchedInstruction = 0x1400001d;  // b no_op_return
+    auto address = reinterpret_cast<uint32_t *>(
+        MinecraftUtils::getLibraryBase(handle) + instructionOffset);
+
+    if(*address == patchedInstruction) {
+        Log::info("Smoothness", "Periodic in-session LevelDB auto-compaction is already disabled");
+        return;
+    }
+    if(*address != expectedInstruction) {
+        Log::warn("Smoothness",
+                  "Refusing auto-compaction patch: unexpected instruction 0x%08x at +0x%" PRIxPTR,
+                  *address, instructionOffset);
+        return;
+    }
+
+    long pageSize = sysconf(_SC_PAGESIZE);
+    auto page = reinterpret_cast<void *>(
+        reinterpret_cast<uintptr_t>(address) & ~(static_cast<uintptr_t>(pageSize) - 1));
+    if(mprotect(page, static_cast<size_t>(pageSize), PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        Log::warn("Smoothness", "Unable to make auto-compaction code writable: %s", std::strerror(errno));
+        return;
+    }
+
+    __atomic_store_n(address, patchedInstruction, __ATOMIC_RELEASE);
+    __builtin___clear_cache(reinterpret_cast<char *>(address),
+                            reinterpret_cast<char *>(address + 1));
+    if(mprotect(page, static_cast<size_t>(pageSize), PROT_READ | PROT_EXEC) != 0)
+        Log::warn("Smoothness", "Unable to restore auto-compaction code protection: %s",
+                  std::strerror(errno));
+
+    Log::info("Smoothness",
+              "Disabled periodic in-session LevelDB auto-compaction; load/save compaction remains enabled");
+}
 
 int main(int argc, char* argv[]) {
     if(argc == 2 && argv[1][0] != '-') {
@@ -425,6 +480,7 @@ Hardware	: Qualcomm Technologies, Inc MSM8998
     Log::info("Launcher", "Loaded Minecraft library");
     Log::debug("Launcher", "Minecraft is at offset 0x%" PRIXPTR, (uintptr_t)MinecraftUtils::getLibraryBase(handle));
     base = MinecraftUtils::getLibraryBase(handle);
+    disablePeriodicAutoCompaction(handle);
 
     if(!freeOnly.get()) {
         modLoader.loadModsFromDirectory(PathHelper::getPrimaryDataDirectory() + "mods/");
@@ -502,6 +558,9 @@ Hardware	: Qualcomm Technologies, Inc MSM8998
     support.registerMinecraftNatives(+[](const char* sym) {
         return linker::dlsym(handle, sym);
     });
+    if(options.graphicsApi == GraphicsApi::OPENGL_ES2) {
+        FakeLooper::releaseWindowContext();
+    }
     std::thread startThread([&support]() {
         support.startGame((ANativeActivity_createFunc*)linker::dlsym(handle, "ANativeActivity_onCreate"),
                           linker::dlsym(handle, "stbi_load_from_memory"),

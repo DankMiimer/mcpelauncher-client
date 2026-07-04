@@ -3,6 +3,8 @@
 #include <fake-jni/fake-jni.h>
 #include "java_types.h"
 #include "../text_input_handler.h"
+#include <cstdlib>
+#include <log.h>
 
 class BuildVersion : public FakeJni::JObject {
 public:
@@ -98,6 +100,22 @@ private:
     bool ignoreNextHideKeyboard = false;
     FakeJni::JInt lastChar = 0;
 
+    static float getReportedDisplayScale() {
+        // Float, 0.25-4.0. Values below 1 report a smaller screen than the
+        // real EGL surface, magnifying the whole UI (0.5 => 2x UI).
+        static float scale = []() {
+            const char *value = std::getenv("MCPE_REPORTED_DISPLAY_SCALE");
+            if(value == nullptr || *value == '\0')
+                return 1.0f;
+            char *end = nullptr;
+            float parsed = std::strtof(value, &end);
+            if(end == value || *end != '\0' || !(parsed >= 0.25f && parsed <= 4.0f))
+                return 1.0f;
+            return parsed;
+        }();
+        return scale;
+    }
+
 public:
     unsigned char *(*stbi_load_from_memory)(unsigned char const *buffer, int len, int *x, int *y, int *channels_in_file, int desired_channels);
     void (*stbi_image_free)(void *retval_from_stbi_load);
@@ -116,25 +134,41 @@ public:
     int getScreenWidth() {
         int width, height;
         window->getWindowSize(width, height);
-        return width;
+        int v = static_cast<int>(width * getReportedDisplayScale());
+        static int logged = 0;
+        if(logged++ < 4)
+            Log::info("UIDiag", "getScreenWidth -> %d", v);
+        return v;
     }
 
     int getScreenHeight() {
         int width, height;
         window->getWindowSize(width, height);
-        return height;
+        int v = static_cast<int>(height * getReportedDisplayScale());
+        static int logged = 0;
+        if(logged++ < 4)
+            Log::info("UIDiag", "getScreenHeight -> %d", v);
+        return v;
     }
 
     int getDisplayWidth() {
         int width, height;
         window->getWindowSize(width, height);
-        return width;
+        int v = static_cast<int>(width * getReportedDisplayScale());
+        static int logged = 0;
+        if(logged++ < 4)
+            Log::info("UIDiag", "getDisplayWidth -> %d", v);
+        return v;
     }
 
     int getDisplayHeight() {
         int width, height;
         window->getWindowSize(width, height);
-        return height;
+        int v = static_cast<int>(height * getReportedDisplayScale());
+        static int logged = 0;
+        if(logged++ < 4)
+            Log::info("UIDiag", "getDisplayHeight -> %d", v);
+        return v;
     }
 
     void tick() {}

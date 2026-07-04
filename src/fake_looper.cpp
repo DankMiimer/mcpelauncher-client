@@ -24,6 +24,13 @@ void FakeLooper::initWindow() {
     currentLooper->initializeWindow();
 }
 
+void FakeLooper::releaseWindowContext() {
+    if(currentLooper && currentLooper->associatedWindow) {
+        Log::trace("Launcher", "Releasing bootstrap GL context before starting Minecraft");
+        currentLooper->associatedWindow->makeCurrent(false);
+    }
+}
+
 void FakeLooper::initHybrisHooks(std::unordered_map<std::string, void *> &syms) {
     syms["ALooper_prepare"] = (void *)+[]() {
         if(currentLooper && currentLooper->prepared)
@@ -39,7 +46,19 @@ void FakeLooper::initHybrisHooks(std::unordered_map<std::string, void *> &syms) 
     syms["ALooper_addFd"] = (void *)+[](ALooper *looper, int fd, int ident, int events, ALooper_callbackFunc callback, void *data) {
         return ((FakeLooper *)(void *)looper)->addFd(fd, ident, events, callback, data);
     };
+    syms["ALooper_forThread"] = (void *)+[]() {
+        return (ALooper *)(void *)currentLooper.get();
+    };
+    syms["ALooper_acquire"] = (void *)+[](ALooper *) {};
+    syms["ALooper_release"] = (void *)+[](ALooper *) {};
+    syms["ALooper_removeFd"] = (void *)+[](ALooper *, int) {
+        return 1;
+    };
+    syms["ALooper_wake"] = (void *)+[](ALooper *) {};
     syms["ALooper_pollAll"] = (void *)+[](int timeoutMillis, int *outFd, int *outEvents, void **outData) {
+        return currentLooper->pollAll(timeoutMillis, outFd, outEvents, outData);
+    };
+    syms["ALooper_pollOnce"] = (void *)+[](int timeoutMillis, int *outFd, int *outEvents, void **outData) {
         return currentLooper->pollAll(timeoutMillis, outFd, outEvents, outData);
     };
     syms["AInputQueue_attachLooper"] = (void *)+[](AInputQueue *queue, ALooper *looper, int ident, ALooper_callbackFunc callback, void *data) {

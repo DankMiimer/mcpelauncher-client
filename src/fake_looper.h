@@ -59,5 +59,7 @@ public:
 
     static void initWindow();
 
+    static void releaseWindowContext();
+
     static void initHybrisHooks(std::unordered_map<std::string, void *> &syms);
 };

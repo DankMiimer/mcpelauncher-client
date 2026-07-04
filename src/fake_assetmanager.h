@@ -8,9 +8,15 @@
 struct AAssetManager;
 
 struct FakeAssetManager {
+    static FakeAssetManager *current;
     std::string rootDir;
 
     FakeAssetManager(std::string rootDir);
+    ~FakeAssetManager();
+
+    static FakeAssetManager *getCurrent() {
+        return current;
+    }
 
     static void initHybrisHooks(std::unordered_map<std::string, void *> &syms);
 
