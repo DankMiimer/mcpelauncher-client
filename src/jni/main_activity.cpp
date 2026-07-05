@@ -28,6 +28,12 @@ std::shared_ptr<FakeJni::JString> MainActivity::createUUID() {
     return UUID::randomUUID()->toString();
 }
 
+FakeJni::JBoolean MainActivity::isEduMode() {
+    // 1.16.x queries this via JNI; the game-side Java_ export crashes
+    // without a real Android activity, so answer launcher-side.
+    return false;
+}
+
 FakeJni::JFloat MainActivity::getPixelsPerMillimeter() {
     // assume 96 DPI for now with GUI scale of 2
     float v = (96 / 25.4f) * 2 * Settings::scale;

@@ -174,6 +174,12 @@ public:
     void tick() {}
 
     FakeJni::JBoolean isNetworkEnabled(FakeJni::JBoolean wifi) {
+        // Some old versions (1.16) init a broken cpprest/boost-asio stack at
+        // startup and crash if the game thinks network is up. Allow reporting
+        // "no network" to skip that path.
+        const char *off = std::getenv("MCPE_FAKE_NO_NETWORK");
+        if(off != nullptr && *off == '1')
+            return false;
         return true;
     }
 
@@ -222,6 +228,7 @@ public:
     }
 
     FakeJni::JFloat getPixelsPerMillimeter();
+    FakeJni::JBoolean isEduMode();
 
     FakeJni::JInt getPlatformDpi();
 

@@ -72,6 +72,88 @@ void printVersionInfo();
 
 void loadGameOptions();
 
+
+static void patchEduModeNullDeref(void *handle) {
+    const char *disabled = std::getenv("MCPE_PATCH_EDUMODE");
+    if(disabled != nullptr && std::strcmp(disabled, "0") == 0)
+        return;
+
+    // 1.16.x: Java_com_mojang_minecraftpe_MainActivity_isEduMode is also
+    // called internally before its backing global exists and null-derefs on
+    // the empty path (crash at +0xd4 on official arm64 1.16.221.01). Force
+    // it to report Education Mode off. Newer versions do not match the
+    // prologue signature and are left untouched.
+    auto address = reinterpret_cast<uint32_t *>(
+        linker::dlsym(handle, "Java_com_mojang_minecraftpe_MainActivity_isEduMode"));
+    if(address == nullptr)
+        return;
+
+    constexpr uint32_t expected[4] = {0xd10143ff, 0xa9034ff4, 0xa9047bfd, 0x910103fd};
+    constexpr uint32_t patched[2] = {0x52800000 /* mov w0, #0 */, 0xd65f03c0 /* ret */};
+    if(address[0] == patched[0] && address[1] == patched[1])
+        return;
+    for(int i = 0; i < 4; i++) {
+        if(address[i] != expected[i]) {
+            Log::info("Compat", "isEduMode patch not applicable (0x%08x at +%d)", address[i], i);
+            return;
+        }
+    }
+
+    long pageSize = sysconf(_SC_PAGESIZE);
+    auto page = reinterpret_cast<void *>(
+        reinterpret_cast<uintptr_t>(address) & ~(static_cast<uintptr_t>(pageSize) - 1));
+    if(mprotect(page, static_cast<size_t>(pageSize) * 2, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        Log::warn("Compat", "Unable to make isEduMode writable: %s", std::strerror(errno));
+        return;
+    }
+    __atomic_store_n(&address[1], patched[1], __ATOMIC_RELEASE);
+    __atomic_store_n(&address[0], patched[0], __ATOMIC_RELEASE);
+    __builtin___clear_cache(reinterpret_cast<char *>(address),
+                            reinterpret_cast<char *>(address + 2));
+    Log::info("Compat", "Patched isEduMode null-deref (1.16.x): Education Mode forced off");
+}
+
+
+static void patchOldHttpResolveCrash(void *handle) {
+    const char *disabled = std::getenv("MCPE_PATCH_HTTP_RESOLVE");
+    if(disabled != nullptr && std::strcmp(disabled, "0") == 0)
+        return;
+
+    // Only the official arm64 1.16.221.01 binary; other versions differ.
+    auto gameDir = PathHelper::getGameDir();
+    if(gameDir.find("1.16.221.01") == std::string::npos)
+        return;
+
+    constexpr uintptr_t instructionOffset = 0x060a01e4;
+    constexpr uint32_t expectedInstruction = 0x340002e8; // cbz w8, success->crash
+    constexpr uint32_t patchedInstruction = 0xd503201f;  // nop -> take error path
+    auto address = reinterpret_cast<uint32_t *>(
+        MinecraftUtils::getLibraryBase(handle) + instructionOffset);
+
+    if(*address == patchedInstruction) {
+        Log::info("Compat", "1.16 HTTP-resolve crash already patched");
+        return;
+    }
+    if(*address != expectedInstruction) {
+        Log::warn("Compat",
+                  "Refusing 1.16 HTTP-resolve patch: unexpected instruction 0x%08x at +0x%" PRIxPTR,
+                  *address, instructionOffset);
+        return;
+    }
+
+    long pageSize = sysconf(_SC_PAGESIZE);
+    auto page = reinterpret_cast<void *>(
+        reinterpret_cast<uintptr_t>(address) & ~(static_cast<uintptr_t>(pageSize) - 1));
+    if(mprotect(page, static_cast<size_t>(pageSize), PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        Log::warn("Compat", "Unable to make HTTP-resolve code writable: %s", std::strerror(errno));
+        return;
+    }
+    __atomic_store_n(address, patchedInstruction, __ATOMIC_RELEASE);
+    __builtin___clear_cache(reinterpret_cast<char *>(address),
+                            reinterpret_cast<char *>(address + 1));
+    Log::info("Compat", "Patched 1.16 startup HTTP-resolve crash (forced offline resolve path)");
+}
+
 static void disablePeriodicAutoCompaction(void *handle) {
     const char *enabled = std::getenv("MCPE_DISABLE_AUTO_COMPACTION");
     if(enabled == nullptr || std::strcmp(enabled, "1") != 0)
@@ -481,6 +563,8 @@ Hardware	: Qualcomm Technologies, Inc MSM8998
     Log::debug("Launcher", "Minecraft is at offset 0x%" PRIXPTR, (uintptr_t)MinecraftUtils::getLibraryBase(handle));
     base = MinecraftUtils::getLibraryBase(handle);
     disablePeriodicAutoCompaction(handle);
+    patchEduModeNullDeref(handle);
+    patchOldHttpResolveCrash(handle);
 
     if(!freeOnly.get()) {
         modLoader.loadModsFromDirectory(PathHelper::getPrimaryDataDirectory() + "mods/");
